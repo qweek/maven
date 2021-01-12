@@ -25,6 +25,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 
 import javax.inject.Named;
 import javax.inject.Singleton;
@@ -44,41 +45,41 @@ import org.codehaus.plexus.personality.plexus.lifecycle.phase.Disposable;
 public class DefaultExtensionRealmCache
     implements ExtensionRealmCache, Disposable
 {
+
     /**
-     * CacheKey
+     * Control flag to restore legacy filesystem behaviour in case issues.
      */
-    protected static class CacheKey
+    private final boolean useFsKey = Boolean.getBoolean( "maven.extensions.fskey" );
+
+    /**
+     * Legacy key implementation which access file system each time just to create a key. As this operation is invoked
+     * under a lock it slows down graph build significantly on slow file systems. Initial reason for this implementation
+     * is unknown, but we can assume it is a sort of protection from background file modifications at build time.
+     * Though such protection itself raises questions of build correctness if maven coordinates map to physically
+     * different filesets during the same build.
+     *
+     * @deprecated use {@link ArtifactCacheKey}
+     * @see #createKey(List)
+     */
+    protected static class FileCacheKey
         implements Key
     {
 
-        private final List<File> files;
-
-        private final List<Long> timestamps;
-
-        private final List<Long> sizes;
-
-        private final List<String> ids;
+        private final List<FileInfo> files;
 
         private final int hashCode;
 
-        public CacheKey( List<Artifact> extensionArtifacts )
+        private FileCacheKey( List<Artifact> extensionArtifacts )
         {
-            this.files = new ArrayList<>( extensionArtifacts.size() );
-            this.timestamps = new ArrayList<>( extensionArtifacts.size() );
-            this.sizes = new ArrayList<>( extensionArtifacts.size() );
-            this.ids = new ArrayList<>( extensionArtifacts.size() );
-
-            for ( Artifact artifact : extensionArtifacts )
+            this.files = extensionArtifacts.stream().map( artifact ->
             {
                 File file = artifact.getFile();
-                files.add( file );
-                timestamps.add( ( file != null ) ? Long.valueOf( file.lastModified() ) : Long.valueOf( 0 ) );
-                sizes.add( ( file != null ) ? Long.valueOf( file.length() ) : Long.valueOf( 0 ) );
-                ids.add( artifact.getVersion() );
-            }
+                long lastModified = file != null ? file.lastModified() : 0;
+                long size = file != null ? file.length() : 0;
+                return new FileInfo( file, lastModified, size, artifact.getVersion() );
+            } ).collect( Collectors.toCollection( ArrayList::new ) );
 
-            this.hashCode =
-                31 * files.hashCode() + 31 * ids.hashCode() + 31 * timestamps.hashCode() + 31 * sizes.hashCode();
+            this.hashCode = files.hashCode();
         }
 
         @Override
@@ -95,15 +96,14 @@ public class DefaultExtensionRealmCache
                 return true;
             }
 
-            if ( !( o instanceof CacheKey ) )
+            if ( !( o instanceof FileCacheKey ) )
             {
                 return false;
             }
 
-            CacheKey other = (CacheKey) o;
+            FileCacheKey other = (FileCacheKey) o;
 
-            return ids.equals( other.ids ) && files.equals( other.files ) && timestamps.equals( other.timestamps )
-                && sizes.equals( other.sizes );
+            return files.equals( other.files );
         }
 
         @Override
@@ -113,12 +113,68 @@ public class DefaultExtensionRealmCache
         }
     }
 
+    /**
+     * Lightweight artifact coordinates based key
+     * @see #createKey(List)
+     */
+    protected static class ArtifactCacheKey
+            implements Key
+    {
+
+        private final List<String> artifactKeys;
+
+        private final int hashCode;
+
+        private ArtifactCacheKey( List<Artifact> extensionArtifacts )
+        {
+            this.artifactKeys = extensionArtifacts.stream().map( ArtifactCacheKey::getArtifactKey )
+                    .collect( Collectors.toCollection( ArrayList::new ) );
+            this.hashCode = artifactKeys.hashCode();
+        }
+
+        private static String getArtifactKey( Artifact artifact )
+        {
+            return artifact.getGroupId() + ":" + artifact.getArtifactId() + ":" + artifact.getVersion()
+                    + ( artifact.hasClassifier() ? ":" + artifact.getClassifier() : "" ) + ":" + artifact.getType();
+        }
+
+        @Override
+        public int hashCode()
+        {
+            return hashCode;
+        }
+
+        @Override
+        public boolean equals( Object o )
+        {
+            if ( o == this )
+            {
+                return true;
+            }
+
+            if ( !( o instanceof ArtifactCacheKey ) )
+            {
+                return false;
+            }
+
+            ArtifactCacheKey other = (ArtifactCacheKey) o;
+
+            return artifactKeys.equals( other.artifactKeys );
+        }
+
+        @Override
+        public String toString()
+        {
+            return artifactKeys.toString();
+        }
+    }
+
     protected final Map<Key, CacheRecord> cache = new ConcurrentHashMap<>();
 
     @Override
     public Key createKey( List<Artifact> extensionArtifacts )
     {
-        return new CacheKey( extensionArtifacts );
+        return useFsKey ? new FileCacheKey( extensionArtifacts ) : new ArtifactCacheKey( extensionArtifacts );
     }
 
     public CacheRecord get( Key key )
@@ -170,4 +226,47 @@ public class DefaultExtensionRealmCache
         flush();
     }
 
+    private static class FileInfo
+    {
+        private final File file;
+        private final Long lastModified;
+        private final Long size;
+        private final String version;
+
+        FileInfo( File file, long lastModified, long size, String version )
+        {
+            this.file = file;
+            this.lastModified = lastModified;
+            this.size = size;
+            this.version = version;
+        }
+
+        @Override
+        public boolean equals( Object o )
+        {
+            if ( this == o )
+            {
+                return true;
+            }
+            if ( o == null || getClass() != o.getClass() )
+            {
+                return false;
+            }
+            FileInfo fileInfo = (FileInfo) o;
+            return Objects.equals( file, fileInfo.file ) && lastModified.equals( fileInfo.lastModified ) && size.equals(
+                    fileInfo.size ) && Objects.equals( version, fileInfo.version );
+        }
+
+        @Override
+        public int hashCode()
+        {
+            return Objects.hash( file, lastModified, size, version );
+        }
+
+        @Override
+        public String toString()
+        {
+            return String.valueOf( file );
+        }
+    }
 }
